@@ -1,0 +1,292 @@
+; -------------------------------------------------------------------
+; 80386
+; 32-bit x86 assembly language
+; TASM
+;
+; author:      Haris Imassadone & Yara Mabrouk
+; date:        18-10-2026
+; program:     Bubble Shooter (skelet - stap 1)
+; -------------------------------------------------------------------
+
+IDEAL
+P386
+MODEL FLAT, C
+ASSUME cs:_TEXT,ds:FLAT,es:FLAT,fs:FLAT,gs:FLAT
+
+; cte (macros met EQU = compile-time constanten)
+VMEMADR     EQU 0A0000h         ; start van het video geheugen (mode 13h)
+SCRWIDTH    EQU 320             ; schermbreedte in pixels
+SCRHEIGHT   EQU 200             ; schermhoogte in pixels
+
+; toetsen: scancodes (komen terug in AH na int 16h)
+KEY_ESC     EQU 01h
+KEY_LEFT    EQU 4Bh
+KEY_RIGHT   EQU 4Dh
+KEY_SPACE   EQU 39h             
+
+; kleurindexen in ons eigen palette 
+COL_BG      EQU 0               
+COL_WHITE   EQU 1
+COL_RED     EQU 2
+COL_GREEN   EQU 3
+COL_BLUE    EQU 4
+COL_YELLOW  EQU 5
+COL_PURPLE  EQU 6
+COL_ORANGE  EQU 7
+COL_GREY    EQU 8
+PAL_COUNT   EQU 9               ; aantal kleuren in onze palette-tabel
+
+; kanon 
+CANNON_W    EQU 20              ; breedte in pixels
+CANNON_H    EQU 12              ; hoogte in pixels
+CANNON_Y    EQU SCRHEIGHT - CANNON_H - 2   ; vaste y-positie (onderaan)
+CANNON_SPEED EQU 4              ; pixels per frame bij toetsdruk
+CANNON_MAXX EQU SCRWIDTH - CANNON_W        ; maximale x (rechterrand)
+
+; dit voor bubbles, schieten, grid, score, game state machine, ... 
+; GRID_COLS   EQU 8
+; GRID_ROWS   EQU 12
+; BUBBLE_SIZE EQU 16
+; STATE_MENU / STATE_PLAYING / STATE_GAMEOVER ...
+
+; -------------------------------------------------------------------
+; CODE
+; -------------------------------------------------------------------
+CODESEG
+start:
+    sti                        
+    cld                        
+     push ds
+     pop es     
+    ; --- 1. initialisatie ---
+    call setVideoMode, 13h      ; naar grafische mode 13h
+    call setPalette             ; eigen kleuren inladen
+
+    ; --- 2. game loop ---
+main_loop:
+    call processUserInput       ; EAX = 1 als het spel moet stoppen (ESC)
+    cmp eax, 0
+    jnz exit_game
+    ;call updateWorld            
+    call drawWorld              ; tekent in buffer, wacht op retrace, kopieert naar scherm
+    jmp main_loop
+
+    ; --- 3. afsluiten ---
+exit_game:
+    call setVideoMode, 03h      ; terug naar tekstmode 
+    mov ax, 4C00h        
+    int 21h     
+
+; procedure setVideoMode
+;   Zet de video mode via BIOS int 10h (AH=0, AL=mode).
+;   Input: mode (13h = grafisch, 03h = tekst)
+PROC setVideoMode
+    ARG @@mode:dword
+    USES eax
+
+    mov eax, [@@mode]           ; AH wordt 0 (functie 0 = set video mode), AL = mode
+    int 10h
+    ret
+ENDP setVideoMode
+
+; procedure setPalette
+;   Laadt onze eigen palette-tabel (DATASEG) in de VGA DAC.
+;   Per kleur 3 bytes (R,G,B), elk 6 bit (0..63).
+PROC setPalette
+    USES eax, ecx, edx, esi
+
+    mov esi, offset palette     ; bron: onze tabel in het geheugen
+    mov ecx, PAL_COUNT * 3      ; aantal bytes dat naar de poort moet
+    mov dx, 03C8h               ; DAC write port
+    mov al, 0                   ; we beginnen bij kleurindex 0
+    out dx, al                  ; startindex doorgeven
+    inc dx                      ; DAC data port (03C9h)
+    rep outsb                   ; ECX bytes van [ESI] naar poort DX
+    ret
+ENDP setPalette
+
+; procedure fillBackground
+;   Vult de HELE off-screen buffer met 1 kleur.
+;   Input: col (kleurindex)
+PROC fillBackground
+    ARG @@fillcol:byte
+    USES eax, ecx, edi
+
+    mov edi, offset screenBuffer
+    mov ecx, SCRWIDTH * SCRHEIGHT
+    mov al, [@@fillcol]        ; AL = kleur
+    rep stosb                   ; schrijf AL naar [EDI], ECX keer
+    ret
+ENDP fillBackground
+
+; procedure drawFilledRect
+;   Tekent een gevulde rechthoek in de off-screen buffer.
+;   Input: x, y (linkerbovenhoek), w, h (breedte/hoogte, h > 0), col
+PROC drawFilledRect
+    ARG @@x:dword, @@y:dword, @@w:dword, @@h:dword, @@col:dword
+    USES eax, ebx, ecx, edx, edi
+
+    cld
+    ; offset = y*320 + x ; y*320 = y*256 + y*64 (met shifts i.p.v. mul)
+    mov eax, [@@y]
+    mov ebx, eax
+    shl eax, 8                  ; y * 256, herinner shifts sneller dan mul
+    shl ebx, 6                  ; y * 64
+    add eax, ebx                ; y * 320
+    mov edi, offset screenBuffer
+    add edi, eax
+    add edi, [@@x]              ; EDI wijst nu naar de eerste pixel
+
+    mov eax, [@@col]            ; AL = kleur (voor stosb)
+    mov edx, [@@h]              ; EDX = aantal rijen dat nog moet
+    cmp edx, 0
+    je @@done                   ; niets te tekenen
+
+@@row:
+    mov ecx, [@@w]              ; 1 rij = w pixels
+    push edi                    ; begin van de rij bewaren
+    rep stosb
+    pop edi
+    add edi, SCRWIDTH           ; 1 rij lager
+    dec edx
+    jnz @@row
+@@done:
+    ret
+ENDP drawFilledRect
+
+; procedure waitVBlank
+;   Wacht tot een nieuwe vertical retrace begint (poort 03DAh, bit 3).
+PROC waitVBlank
+    USES eax, edx
+
+    mov dx, 03DAh               ; VGA status port
+@@wait1:                        ; zit je al in een retrace? wacht tot die klaar is
+    in al, dx
+    and al, 8
+    jnz @@wait1
+@@wait2:                        ; wacht tot een nieuwe retrace begint
+    in al, dx
+    and al, 8
+    jz @@wait2
+    ret
+ENDP waitVBlank
+
+; procedure copyBuffer
+;   kopieert de off-screen buffer naar het video geheugen (A0000h).
+;   320*200 bytes, per dword (4 bytes) -> 4x sneller.
+PROC copyBuffer
+    USES ecx, esi, edi
+
+    mov esi, offset screenBuffer
+    mov edi, VMEMADR
+    mov ecx, SCRWIDTH * SCRHEIGHT / 4
+    rep movsd
+    ret
+ENDP copyBuffer
+
+; procedure processUserInput
+;   leest (non-blocking) het toetsenbord via BIOS int 16h.
+;   Return: EAX = 1 als het spel moet stoppen (ESC), anders 0.
+; !! later int 16h vervangen  door een eigen keyboard interrupt handler (zie EXAMPLES/KEYB).
+PROC processUserInput
+    USES ebx
+
+    mov ah, 01h                 ; functie 01h: is er een toets in de buffer?
+    int 16h
+    jz @@negative                  ; ZF=1 -> geen toets
+
+    mov ah, 00h                 ; functie 00h: toets uit buffer halen
+    int 16h                     ; AH = scancode, AL = ASCII
+
+    cmp ah, KEY_ESC
+    je @@exit
+    cmp ah, KEY_LEFT
+    je @@move_left
+    cmp ah, KEY_RIGHT
+    je @@move_right
+    jmp @@negative                 ; andere toets: negeren (SPACE komt later)
+
+@@move_left:
+    mov ebx, [cannonX]
+    sub ebx, CANNON_SPEED
+    cmp ebx, 0
+    jge @@store_x               ; nog >= 0: ok
+    xor ebx, ebx                ; anders vastzetten op linkerrand
+    jmp @@store_x
+
+@@move_right:
+    mov ebx, [cannonX]
+    add ebx, CANNON_SPEED
+    cmp ebx, CANNON_MAXX
+    jle @@store_x               ; nog binnen scherm: ok (<= maximum)
+    mov ebx, CANNON_MAXX        ; anders vastzetten op rechterrand
+
+@@store_x:
+    mov [cannonX], ebx
+
+@@negative:
+    xor eax, eax                ; return 0 = doorgaan
+    ret
+
+@@exit:
+    mov eax, 1                  ; return 1 = stoppen
+    ret
+ENDP processUserInput
+
+; procedure updateWorld
+; spellogica:
+;     - bewegende bubbel + botsing met muren (hoek-lookup-tabel)
+;     - bubbel vastzetten in het grid, flood-fill, vallende bubbels
+;     - plafond dat zakt, score, win/lose, game state machine
+PROC updateWorld
+    ; 
+    ret
+ENDP updateWorld
+
+; procedure drawWorld
+;   tekent een volledig frame in de off-screen buffer, wacht dan op de
+;   vertical retrace en kopieert het naar het scherm
+PROC drawWorld
+    ; 1. achtergrond wissen
+    call fillBackground, COL_BG
+
+    ; 2. plafond (grijze balk bovenaan)
+    call drawFilledRect, 0, 0, SCRWIDTH, 4, COL_GREY
+
+    ; 3. kanon-placeholder (x uit geheugen, rest constanten)
+    call drawFilledRect, [cannonX], CANNON_Y, CANNON_W, CANNON_H, COL_GREY
+
+    ; (!!!nog: bubbelgrid, bewegende bubbel, volgende bubbel, score)
+
+    ; 4. naar het scherm
+    call waitVBlank 
+    call copyBuffer
+    ret
+ENDP drawWorld
+; DATA (geinitialiseerd)
+DATASEG
+
+    ; Spelstatus
+    cannonX dd (SCRWIDTH - CANNON_W) / 2   ; kanon begint in het midden
+
+    ; Palette: per kleur R, G, B (6-bit: 0..63). Volgorde = kleurindex!
+    palette db  3,  12, 57    ; 0 COL_BG     donkerblauw
+            db 63, 63, 63       ; 1 COL_WHITE
+            db 63, 10, 10       ; 2 COL_RED
+            db 10, 55, 10       ; 3 COL_GREEN
+            db 15, 25, 63       ; 4 COL_BLUE
+            db 63, 60, 10       ; 5 COL_YELLOW
+            db 50, 15, 55       ; 6 COL_PURPLE
+            db 63, 38,  5       ; 7 COL_ORANGE
+            db 30, 30, 30       ; 8 COL_GREY
+; -------------------------------------------------------------------
+; DATA 
+DATASEG
+
+    screenBuffer db SCRWIDTH * SCRHEIGHT dup (0)   ; off-screen buffer (64000 bytes)
+; -------------------------------------------------------------------
+; STACK
+STACK 1000h
+
+END start
+; -------------------------------------------------------------------
